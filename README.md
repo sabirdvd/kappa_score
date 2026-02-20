@@ -52,3 +52,14 @@ pip install nltk transformers torch pandas scikit-learn numpy
 - Review1 (short): `...video calling n likes & comments features...`
 - Review2 (short): `...Save instead of liking.`
 - Interpretation: contradiction/rule penalties likely suppressed an otherwise related pair.
+
+## Check the file `enhanced_triage.csv`: it's the decision-routing file
+
+  It is not just 0/1 prediction.
+  It assigns each pair to one of three actions:
+
+  - auto_positive -> high-confidence match (can auto-accept as 1)
+  - auto_negative -> high-confidence non-match (can auto-accept as 0)
+  - needs_review -> uncertain case, send to human
+
+

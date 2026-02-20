@@ -24,7 +24,7 @@ pip install nltk transformers torch pandas scikit-learn numpy
 
 ### `nli_enhanced_eval.py` 
 
-| # | System Variant | Best th | Acc | F1 | Kappa | BalAcc | TP | TN | FP | FN |
+| # | Model | Best th | Acc | F1 | Kappa | BalAcc | TP | TN | FP | FN |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1 | NLI only | 0.49 | 0.6667 | 0.6905 | 0.3504 | 0.6817 | 29 | 23 | 20 | 6 |
 | 2 | Similarity only | 0.73 | 0.6667 | 0.7111 | 0.3603 | 0.6897 | 32 | 20 | 23 | 3 |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NLI + similarity matcher with threshold tuning and optional LLM as a judge.
+"""NLI + similarity with threshold tuning and optional LLM as a judge.
 
 Run without LLM:
 python3 nli_enhanced_eval.py \

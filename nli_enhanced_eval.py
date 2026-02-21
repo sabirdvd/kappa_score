@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NLI + similarity with threshold tuning and optional LLM as a judge.
+"""NLI + similarity matcher with threshold tuning and optional LLM as a judge.
 
 Run without LLM:
 python3 nli_enhanced_eval.py \
@@ -23,6 +23,33 @@ python3 nli_enhanced_eval.py \
   --embedding-model sentence-transformers/all-MiniLM-L6-v2 \
   --nli-score-mode contra_norm \
   --llm-judge --llm-gpt5-api --llm-model gpt-5
+
+Run with GPT-5-mini API judge:
+python3 nli_enhanced_eval.py \
+  --csv "Ground Truth.csv" \
+  --model roberta-large-mnli \
+  --target-label consensus_only \
+  --objective kappa \
+  --cv-folds 5 \
+  --similarity-method cosine \
+  --embedding-model sentence-transformers/all-MiniLM-L6-v2 \
+  --nli-score-mode contra_norm \
+  --llm-judge --llm-gpt5-api --llm-model gpt-5-mini
+  
+
+Best result with GPT-5 and DeBERTa-v3_ANLI
+python3 nli_enhanced_eval.py \
+  --csv "Ground Truth.csv" \
+  --model MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli \
+  --target-label consensus_only \
+  --objective kappa \
+  --cv-folds 5 \
+  --similarity-method cosine \
+  --embedding-model sentence-transformers/all-MiniLM-L6-v2 \
+  --nli-score-mode contra_norm \
+  --llm-judge --llm-gpt5-api --llm-model gpt-5 \
+  --llm-on needs_review --llm-confidence-th 0.6 --llm-votes 3
+  
 """
 
 import argparse
@@ -327,12 +354,23 @@ def find_triage_thresholds(
 def _extract_response_text(resp: Dict) -> str:
     if isinstance(resp.get("output_text"), str) and resp["output_text"]:
         return resp["output_text"]
+    # Some structured-output responses may expose parsed JSON directly.
+    if isinstance(resp.get("output_parsed"), (dict, list)):
+        try:
+            return json.dumps(resp["output_parsed"])
+        except Exception:
+            pass
     out = resp.get("output", [])
     texts: List[str] = []
     for item in out:
         for c in item.get("content", []):
             if c.get("type") in {"output_text", "text"} and c.get("text"):
                 texts.append(c["text"])
+            elif c.get("type") in {"output_json", "json"} and c.get("json") is not None:
+                try:
+                    texts.append(json.dumps(c["json"]))
+                except Exception:
+                    pass
     return "\n".join(texts)
 
 
@@ -380,6 +418,36 @@ def _parse_judge_json(text: str) -> tuple[Optional[int], float, str]:
     return lbl, conf, rationale
 
 
+def build_llm_user_prompt(f1: str, r1: str, f2: str, r2: str, icl_shots: int) -> str:
+    if icl_shots == 3:
+        shots = (
+            "Example 1\n"
+            "Pair A:\nFeature: dark mode\nReview: I love the dark theme at night.\n"
+            "Pair B:\nFeature: dark mode\nReview: The app finally has night mode.\n"
+            'Answer: {"label":"same","confidence":0.95,"rationale":"Both describe dark mode."}\n\n'
+            "Example 2\n"
+            "Pair A:\nFeature: export pdf\nReview: I can save invoices as PDF.\n"
+            "Pair B:\nFeature: cloud backup\nReview: My data syncs to cloud automatically.\n"
+            'Answer: {"label":"different","confidence":0.97,"rationale":"Different product functions."}\n\n'
+            "Example 3\n"
+            "Pair A:\nFeature: add items to list\nReview: I can quickly list my groceries.\n"
+            "Pair B:\nFeature: list maker\nReview: This app is perfect for making lists.\n"
+            'Answer: {"label":"same","confidence":0.88,"rationale":"Same list-creation intent."}\n\n'
+        )
+        query = (
+            f"Now judge this case.\n"
+            f"Pair A:\nFeature: {f1}\nReview: {r1}\n\n"
+            f"Pair B:\nFeature: {f2}\nReview: {r2}\n\n"
+            "Answer JSON only."
+        )
+        return shots + query
+    return (
+        f"Pair A:\nFeature: {f1}\nReview: {r1}\n\n"
+        f"Pair B:\nFeature: {f2}\nReview: {r2}\n\n"
+        "Are Pair A and Pair B the same meaning?"
+    )
+
+
 def llm_judge_once(
     api_base: str,
     api_key: str,
@@ -388,6 +456,7 @@ def llm_judge_once(
     r1: str,
     f2: str,
     r2: str,
+    icl_shots: int,
     temperature: float,
     max_output_tokens: int,
     timeout_sec: int,
@@ -395,40 +464,111 @@ def llm_judge_once(
     sys = (
         "You are a strict semantic judge. Compare two feature-review pairs. "
         "Return JSON only: "
-        "{\"label\":\"same|different\",\"confidence\":0..1,\"rationale\":\"short\"}."
+        "{\"label\":\"same|different\",\"confidence\":0..1,\"rationale\":\"short\"}. "
+        "Keep rationale under 15 words."
     )
-    usr = (
-        f"Pair A:\\nFeature: {f1}\\nReview: {r1}\\n\\n"
-        f"Pair B:\\nFeature: {f2}\\nReview: {r2}\\n\\n"
-        "Are Pair A and Pair B the same meaning?"
-    )
-    payload = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": usr},
-        ],
-        "temperature": temperature,
-        "max_output_tokens": max_output_tokens,
-    }
+    usr = build_llm_user_prompt(f1, r1, f2, r2, icl_shots)
+    model_l = str(model).lower()
+    # Use the simpler Responses API format for GPT-5 family.
+    if model_l.startswith("gpt-5"):
+        payload = {
+            "model": model,
+            "instructions": sys,
+            "input": usr,
+            "max_output_tokens": max_output_tokens,
+            "reasoning": {"effort": "low"},
+        }
+    else:
+        payload = {
+            "model": model,
+            "input": [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": usr},
+            ],
+            "max_output_tokens": max_output_tokens,
+        }
+    # GPT-5 family does not support temperature on Responses API.
+    # For other models/endpoints, send it only when explicitly > 0.
+    supports_temperature = not (model_l.startswith("gpt-5"))
+    if supports_temperature and temperature is not None and float(temperature) > 0.0:
+        payload["temperature"] = float(temperature)
+    # Force strict machine-readable output for GPT-5 family.
+    if model_l.startswith("gpt-5"):
+        payload["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "semantic_judge",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "label": {"type": "string", "enum": ["same", "different"]},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "rationale": {"type": "string", "maxLength": 120},
+                    },
+                    "required": ["label", "confidence", "rationale"],
+                },
+            }
+        }
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    try:
+
+    def _post(p: Dict) -> Dict:
         url = api_base.rstrip("/") + "/responses"
         req = urllib.request.Request(
             url=url,
-            data=json.dumps(payload).encode("utf-8"),
+            data=json.dumps(p).encode("utf-8"),
             headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             body = resp.read().decode("utf-8")
-        obj = json.loads(body)
-        text = _extract_response_text(obj)
-        return _parse_judge_json(text)
-    except Exception:
-        return None, 0.0, ""
+        return json.loads(body)
+
+    try:
+        req_payload = dict(payload)
+        for _attempt in range(3):
+            obj = _post(req_payload)
+            if isinstance(obj, dict) and obj.get("error"):
+                try:
+                    emsg = json.dumps(obj["error"])[:300]
+                except Exception:
+                    emsg = str(obj.get("error"))[:300]
+                return None, 0.0, f"API error: {emsg}"
+            text = _extract_response_text(obj)
+            if text:
+                return _parse_judge_json(text)
+
+            status = str(obj.get("status", "")).lower() if isinstance(obj, dict) else ""
+            details = obj.get("incomplete_details") if isinstance(obj, dict) else {}
+            reason = str((details or {}).get("reason", "")).lower()
+            if status == "incomplete" and ("max_output" in reason or "max_tokens" in reason):
+                prev = int(req_payload.get("max_output_tokens", max_output_tokens))
+                req_payload["max_output_tokens"] = min(max(prev * 2, prev + 128), 2048)
+                continue
+            return None, 0.0, f"Empty model output: {str(obj)[:300]}"
+        return None, 0.0, f"Incomplete after retries: {str(obj)[:300]}"
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        # Retry once without temperature if endpoint rejects it.
+        if "temperature" in payload and "Unsupported parameter" in body and "temperature" in body:
+            try:
+                payload_retry = dict(payload)
+                payload_retry.pop("temperature", None)
+                obj = _post(payload_retry)
+                text = _extract_response_text(obj)
+                return _parse_judge_json(text)
+            except Exception:
+                pass
+        msg = f"HTTP {e.code} {e.reason}: {body[:300]}"
+        return None, 0.0, msg
+    except Exception as e:
+        return None, 0.0, f"{type(e).__name__}: {str(e)[:300]}"
 
 
 def llm_judge_vote(
@@ -439,31 +579,36 @@ def llm_judge_vote(
     r1: str,
     f2: str,
     r2: str,
+    icl_shots: int,
     temperature: float,
     max_output_tokens: int,
     timeout_sec: int,
     votes: int,
-) -> tuple[Optional[int], float, str]:
+) -> tuple[Optional[int], float, str, float]:
     labels: List[int] = []
     confs: List[float] = []
     rationales: List[str] = []
+    errors: List[str] = []
     for _ in range(max(1, votes)):
         lbl, conf, rat = llm_judge_once(
-            api_base, api_key, model, f1, r1, f2, r2, temperature, max_output_tokens, timeout_sec
+            api_base, api_key, model, f1, r1, f2, r2, icl_shots, temperature, max_output_tokens, timeout_sec
         )
         if lbl is not None:
             labels.append(lbl)
             confs.append(conf)
             if rat:
                 rationales.append(rat)
+        elif rat:
+            errors.append(rat)
     if not labels:
-        return None, 0.0, ""
+        return None, 0.0, (errors[0] if errors else ""), 0.0
     ones = sum(labels)
     zeros = len(labels) - ones
     final = 1 if ones >= zeros else 0
     conf = float(np.mean(confs)) if confs else 0.0
     rat = rationales[0] if rationales else ""
-    return final, conf, rat
+    agreement = float(max(ones, zeros) / max(1, len(labels)))
+    return final, conf, rat, agreement
 
 
 def llm_server_reachable(api_base: str, timeout_sec: int) -> bool:
@@ -512,12 +657,16 @@ def apply_llm_mode_presets(args: argparse.Namespace) -> None:
         raise ValueError("Use only one of --llm-gpt5-api or --llm-open-source.")
     if args.llm_gpt5_api:
         args.llm_judge = True
-        args.llm_model = "gpt-5"
+        if args.llm_model in {"gpt-oss-120b", "gpt-oss-20b"}:
+            args.llm_model = "gpt-5"
         args.llm_api_base = "https://api.openai.com/v1"
         args.llm_api_key_env = "OPENAI_API_KEY"
+        # Safer default policy for GPT judges: only uncertain rows, high confidence.
+        if float(getattr(args, "llm_confidence_th", 0.70)) < 0.90:
+            args.llm_confidence_th = 0.90
     if args.llm_open_source:
         args.llm_judge = True
-        if args.llm_model == "gpt-5":
+        if args.llm_model in {"gpt-5", "gpt-5-mini"}:
             args.llm_model = "gpt-oss-20b"
         if args.llm_api_key_env == "OPENAI_API_KEY":
             args.llm_api_key_env = "NONE"
@@ -545,7 +694,7 @@ def resolve_target_labels(df: pd.DataFrame, target_label: str) -> tuple[pd.DataF
     return eval_df, y_full.astype(int)
 
 
-def run_llm_judge_stage(row_df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+def run_llm_judge_stage(row_df: pd.DataFrame, args: argparse.Namespace, tuned_th: float) -> pd.DataFrame:
     api_key = ""
     if args.llm_api_key_env.upper() != "NONE":
         api_key = os.environ.get(args.llm_api_key_env, "").strip()
@@ -568,6 +717,9 @@ def run_llm_judge_stage(row_df: pd.DataFrame, args: argparse.Namespace) -> pd.Da
         idx = row_df.index[row_df["triage_label"] == "needs_review"].tolist()
     else:
         idx = row_df.index.tolist()
+    if args.llm_uncertainty_band > 0:
+        band = float(args.llm_uncertainty_band)
+        idx = [i for i in idx if abs(float(row_df.at[i, "final_score"]) - float(tuned_th)) <= band]
     if args.llm_max_cases > 0:
         idx = idx[: args.llm_max_cases]
 
@@ -575,9 +727,10 @@ def run_llm_judge_stage(row_df: pd.DataFrame, args: argparse.Namespace) -> pd.Da
     judged = 0
     failed = 0
     eligible = len(idx)
+    failure_reasons: List[str] = []
     for i in idx:
         r = row_df.loc[i]
-        lbl, conf, rat = llm_judge_vote(
+        lbl, conf, rat, agree = llm_judge_vote(
             api_base=args.llm_api_base,
             api_key=api_key,
             model=args.llm_model,
@@ -585,6 +738,7 @@ def run_llm_judge_stage(row_df: pd.DataFrame, args: argparse.Namespace) -> pd.Da
             r1=str(r[COL_R1]),
             f2=str(r[COL_F2]),
             r2=str(r[COL_R2]),
+            icl_shots=int(args.llm_icl_shots),
             temperature=float(args.llm_temperature),
             max_output_tokens=int(args.llm_max_output_tokens),
             timeout_sec=int(args.llm_timeout_sec),
@@ -592,12 +746,15 @@ def run_llm_judge_stage(row_df: pd.DataFrame, args: argparse.Namespace) -> pd.Da
         )
         if lbl is None:
             failed += 1
+            if rat:
+                failure_reasons.append(rat)
             continue
         judged += 1
         row_df.at[i, "llm_label"] = int(lbl)
         row_df.at[i, "llm_confidence"] = float(conf)
         row_df.at[i, "llm_rationale"] = rat
-        if conf >= args.llm_confidence_th:
+        unanimous_ok = (not args.llm_require_unanimous) or (agree >= 0.999999)
+        if conf >= args.llm_confidence_th and unanimous_ok:
             base_pred = int(row_df.at[i, "pred_final"])
             row_df.at[i, "pred_final"] = int(lbl)
             if base_pred != int(lbl):
@@ -607,8 +764,19 @@ def run_llm_judge_stage(row_df: pd.DataFrame, args: argparse.Namespace) -> pd.Da
 
     print(
         f"LLM judge(api): model={args.llm_model} judged={judged} overrides={overrides} "
-        f"failed={failed} (on={args.llm_on}, confidence_th={args.llm_confidence_th:.2f})"
+        f"failed={failed} (on={args.llm_on}, confidence_th={args.llm_confidence_th:.2f}, "
+        f"band={args.llm_uncertainty_band:.3f}, unanimous={args.llm_require_unanimous})"
     )
+    if failed > 0 and failure_reasons:
+        # Print only a few unique reasons to keep terminal output readable.
+        seen = []
+        for msg in failure_reasons:
+            if msg not in seen:
+                seen.append(msg)
+            if len(seen) >= 3:
+                break
+        for i, msg in enumerate(seen, start=1):
+            print(f"LLM error {i}: {msg}")
     if args.llm_fail_on_error and failed > 0:
         raise RuntimeError(
             f"LLM judge had {failed} failed calls out of {eligible} eligible rows "
@@ -741,7 +909,7 @@ def main() -> None:
     parser.add_argument(
         "--llm-model",
         default="gpt-5",
-        choices=["gpt-5", "gpt-oss-120b", "gpt-oss-20b"],
+        choices=["gpt-5", "gpt-5-mini", "gpt-oss-120b", "gpt-oss-20b"],
         help="LLM judge model name.",
     )
     parser.add_argument("--llm-api-base", default="https://api.openai.com/v1", help="OpenAI-compatible API base.")
@@ -758,7 +926,30 @@ def main() -> None:
     )
     parser.add_argument("--llm-confidence-th", type=float, default=0.70, help="Min confidence to override base pred.")
     parser.add_argument("--llm-votes", type=int, default=1, help="Self-consistency votes per case.")
-    parser.add_argument("--llm-temperature", type=float, default=0.0, help="LLM temperature.")
+    parser.add_argument(
+        "--llm-uncertainty-band",
+        type=float,
+        default=0.05,
+        help="Only apply LLM when |final_score - tuned_threshold| <= band.",
+    )
+    parser.add_argument(
+        "--llm-require-unanimous",
+        action="store_true",
+        help="Require unanimous vote agreement before LLM override.",
+    )
+    parser.add_argument(
+        "--llm-icl-shots",
+        type=int,
+        default=0,
+        choices=[0, 3],
+        help="Use in-context examples in LLM prompt (0 or 3).",
+    )
+    parser.add_argument(
+        "--llm-temperature",
+        type=float,
+        default=0.0,
+        help="LLM temperature (sent only when > 0 and endpoint supports it).",
+    )
     parser.add_argument("--llm-max-output-tokens", type=int, default=120, help="Max tokens for LLM response.")
     parser.add_argument("--llm-timeout-sec", type=int, default=60, help="HTTP timeout for LLM calls.")
     parser.add_argument(
@@ -1018,7 +1209,7 @@ def main() -> None:
     row_df["llm_override"] = 0
 
     if args.llm_judge:
-        row_df = run_llm_judge_stage(row_df, args)
+        row_df = run_llm_judge_stage(row_df, args, best_cfg.tuned_th)
 
     row_df["pred_final"] = safe_int_series(row_df["pred_final"])
     row_df["llm_override"] = safe_int_series(row_df["llm_override"])
